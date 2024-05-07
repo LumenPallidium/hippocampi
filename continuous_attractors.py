@@ -77,11 +77,44 @@ class CAN(torch.nn.Module):
         b = torch.einsum("ij,j->i",
                          self.directions,
                          velocity)
-        state = self.weights @ self.state
+        state = self.weights @ self.state.clone()
         state = self.activation(state + 1 + self.alpha * b)
         state_step = step_size * (state - self.state) / self.tau
-        self.state += state_step
-        return self.state
+        new_state = self.state.clone() + state_step.clone()
+        self.state = new_state
+        return new_state
+    
+def positions_to_images(positions,
+                        energies = None,
+                        out_size = None,
+                        diameter = 1):
+    """
+    Convert a list of positions to images
+    """
+    left_corner = positions.min(dim = 0).values
+
+    positions = positions - left_corner
+    length = positions.max().ceil() + 1
+    if out_size is not None:
+        positions = positions / length
+        length = out_size
+    image = torch.zeros(positions.shape[0],
+                        length, length, 3)
+    for i, (x, y) in enumerate(positions):
+        x = int(x * length)
+        y = int(y * length)
+        image[i,
+              x:(x + diameter),
+              y:(y + diameter), :] = 255
+        if energies is not None:
+            # 0 energy is blue, 1 is red
+            energy = (energies[i] - 0.5) * 2
+            image[i:, x:(x + diameter), y:(y + diameter), 0] += torch.maximum(energy,
+                                                                              torch.zeros(1)) * 100
+            image[i:, x:(x + diameter), y:(y + diameter), 2] += torch.maximum(-energy,
+                                                                              torch.zeros(1)) * 100
+
+    return image
     
 #TODO : image not triangular - reshape issue?
 if __name__ == "__main__":
@@ -90,24 +123,50 @@ if __name__ == "__main__":
 
     network_width = 32
     n_steps = 10000
+    fps = 30
+    n_sec = 20
+
+    save_rate = n_steps // (n_sec * fps)
     step_size = 0.5 # ms
-    noise_scale = 0.2
+    noise_scale = 0.001
 
     with torch.no_grad():
         can = CAN(network_width)
+        x = torch.tensor([0, 0], dtype = torch.float32)
         velocity = torch.tensor([0, 0], dtype = torch.float32)
-        frames = [can.state.reshape(network_width, network_width)]
+        frames = []
+        frames_x = []
         for i in tqdm.trange(n_steps):
             state = can(velocity, step_size = step_size).clone()
-            if i % 30 == 0:
+            x += velocity * step_size
+            if (i != 0) & (i % save_rate == 0):
                 frames.append(state.reshape(network_width, network_width))
-            velocity += noise_scale * torch.randn(2)
+                frames_x.append(x.clone())
+            # use sin and cos so velocity is an expanding spiral
+            r = math.sqrt(i) * noise_scale
+            velocity = torch.tensor([r * math.cos(i * 0.01),
+                                     r * math.sin(i * 0.01)],
+                                     dtype = torch.float32)
 
     frames = torch.stack(frames)
+    frames_x = torch.stack(frames_x)
+    energies = torch.norm(frames, dim = (-1, -2))
+    energies = (energies - energies.min()) / (energies.max() - energies.min())
+
+    frames_x = positions_to_images(frames_x,
+                                   energies,
+                                   out_size = network_width)
+
+    
     # convert to uint8 for video
     frames = (frames - frames.min()) / (frames.max() - frames.min())
     frames = (frames * 255).to(torch.uint8).unsqueeze(-1).repeat(1, 1, 1, 3)
-    torchvision.io.write_video("can.mp4", frames, fps = 30)
+
+    # append x position to frames
+    frames = torch.cat([frames,
+                        frames_x],
+                        dim = -2)
+    torchvision.io.write_video("can.mp4", frames, fps = fps)
 
 
 
