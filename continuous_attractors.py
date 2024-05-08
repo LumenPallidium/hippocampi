@@ -4,6 +4,8 @@ import math
 class CAN(torch.nn.Module):
     def __init__(self,
                  length,
+                 periodic = True,
+                 delta_r = None,
                  n_axes = 2,
                  a = 1,
                  lambda_net = 13,
@@ -18,9 +20,14 @@ class CAN(torch.nn.Module):
         self.beta = 3 / (lambda_net ** 2)
         self.gamma = 1.05 * self.beta
         self.l = l
+        self.periodic = periodic
         self.alpha = alpha
         # time constant in ms
         self.tau = tau
+
+        if delta_r is None:
+            delta_r = length
+        self.delta_r = delta_r
 
         self.n_axes = n_axes
         # number of unique angles for a head direction cell
@@ -38,16 +45,22 @@ class CAN(torch.nn.Module):
         n_repeats = (length ** 2) // (self.n_axes ** 2)
         self.directions = directions.repeat(n_repeats, 1)
 
-        self.weights = self._generate_weights()
+        self.weights, self.neuron_grid = self._generate_weights()
         self.state = torch.zeros(self.length * self.length)
         self.activation = activation
+
+    def envelope(self):
+        length_ratio = (self.neuron_grid.norm(dim = 1) - self.length + self.delta_r) 
+        length_ratio /= self.delta_r
+        envelope = torch.exp(-4 * length_ratio ** 2) 
+        return envelope
     
     def center_surround(self, x):
         """
         Center surround function from paper
         """
-        out = self.a * torch.exp(-self.gamma * (x ** 2)) 
-        out -= torch.exp(-self.beta* (x ** 2))
+        out = self.a * torch.exp(-self.gamma * x) 
+        out -= torch.exp(-self.beta * x)
         return out
     
     # TODO : look into convolutions for efficiency
@@ -58,17 +71,18 @@ class CAN(torch.nn.Module):
                                                  torch.arange(-half_length, half_length)),
                                   dim = -1)
         neuron_grid = neuron_grid.reshape(-1, 2).float() # Nx2
+        neuron_grid_vector = neuron_grid.clone()
         # Nx1x2 - 1xNx2 = NxNx2
         distances = neuron_grid.unsqueeze(1) - neuron_grid.unsqueeze(0)
-        # distances with periodic boundary, thanks Claude
-        distances = torch.remainder(distances + half_length, 2 * half_length) - half_length
+        if self.periodic:
+            # distances with periodic boundary, thanks Claude
+            distances = torch.remainder(distances + half_length, 2 * half_length) - half_length
         # NxNx2 -> NxN, 1 norm as in paper
-        distances = torch.norm(distances, p = 1, dim = -1)
-        # shift to preferred direction
-        neuron_grid = neuron_grid - self.l * self.directions
+        distances -= (self.l * self.directions).unsqueeze(0)
+        distances = (distances ** 2).sum(dim = -1)
 
         weights = self.center_surround(distances)
-        return weights
+        return weights, neuron_grid_vector
     
     def forward(self, velocity, step_size = 0.5):
         """
@@ -77,9 +91,12 @@ class CAN(torch.nn.Module):
         b = torch.einsum("ij,j->i",
                          self.directions,
                          velocity)
+        b = 1 + self.alpha * b
+        if not self.periodic:
+            b *= self.envelope()
         state = self.weights @ self.state.clone()
-        state = self.activation(state + 1 + self.alpha * b)
-        state_step = step_size * (state - self.state) / self.tau
+        state = self.activation(state + b)
+        state_step = step_size * (state - self.state.clone()) / self.tau
         new_state = self.state.clone() + state_step.clone()
         self.state = new_state
         return new_state
@@ -131,7 +148,7 @@ if __name__ == "__main__":
     noise_scale = 0.001
 
     with torch.no_grad():
-        can = CAN(network_width)
+        can = CAN(network_width, periodic=False)
         x = torch.tensor([0, 0], dtype = torch.float32)
         velocity = torch.tensor([0, 0], dtype = torch.float32)
         frames = []
@@ -147,10 +164,14 @@ if __name__ == "__main__":
             velocity = torch.tensor([r * math.cos(i * 0.01),
                                      r * math.sin(i * 0.01)],
                                      dtype = torch.float32)
+            # add small jitter
+            velocity += torch.randn(2) * noise_scale
 
     frames = torch.stack(frames)
     frames_x = torch.stack(frames_x)
-    energies = torch.norm(frames, dim = (-1, -2))
+    #energies = torch.norm(frames, dim = (-1, -2))
+    # select single neuron
+    energies = frames[:, 0, 0]
     energies = (energies - energies.min()) / (energies.max() - energies.min())
 
     frames_x = positions_to_images(frames_x,
