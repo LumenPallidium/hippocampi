@@ -11,7 +11,7 @@ class CAN(torch.nn.Module):
                  lambda_net = 13,
                  l = 2,
                  alpha = 0.10315,
-                 tau = 10,
+                 tau = 0.001,
                  activation = torch.nn.ReLU()):
         super().__init__()
         # parameters from paper, see methods
@@ -46,11 +46,15 @@ class CAN(torch.nn.Module):
         self.directions = directions.repeat(n_repeats, 1)
 
         self.weights, self.neuron_grid = self._generate_weights()
-        self.state = torch.zeros(self.length * self.length)
+        self.state = torch.randn(self.length * self.length)
         self.activation = activation
+        self.envelope = self._get_envelope()
 
-    def envelope(self):
-        length_ratio = (self.neuron_grid.norm(dim = 1) - self.length + self.delta_r) 
+    def _get_envelope(self):
+        half_length = self.length // 2
+        length_ratio = (self.neuron_grid.norm(dim = 1) - half_length + self.delta_r)
+        # set to 1 if negative
+        length_ratio = torch.maximum(length_ratio, torch.zeros_like(length_ratio))
         length_ratio /= self.delta_r
         envelope = torch.exp(-4 * length_ratio ** 2) 
         return envelope
@@ -72,14 +76,15 @@ class CAN(torch.nn.Module):
                                   dim = -1)
         neuron_grid = neuron_grid.reshape(-1, 2).float() # Nx2
         neuron_grid_vector = neuron_grid.clone()
-        # Nx1x2 - 1xNx2 = NxNx2
-        distances = neuron_grid.unsqueeze(1) - neuron_grid.unsqueeze(0)
+        shifted_grid = neuron_grid - (self.l * self.directions)
+        distances = torch.cdist(neuron_grid,
+                                shifted_grid,
+                                p = 1)**2
         if self.periodic:
             # distances with periodic boundary, thanks Claude
             distances = torch.remainder(distances + half_length, 2 * half_length) - half_length
         # NxNx2 -> NxN, 1 norm as in paper
-        distances -= (self.l * self.directions).unsqueeze(0)
-        distances = (distances ** 2).sum(dim = -1)
+        # distances = (distances ** 2).sum(dim = -1)
 
         weights = self.center_surround(distances)
         return weights, neuron_grid_vector
@@ -93,8 +98,8 @@ class CAN(torch.nn.Module):
                          velocity)
         b = 1 + self.alpha * b
         if not self.periodic:
-            b *= self.envelope()
-        state = self.weights @ self.state.clone()
+            b *= self.envelope
+        state = self.weights.T @ self.state.clone()
         state = self.activation(state + b)
         state_step = step_size * (state - self.state.clone()) / self.tau
         new_state = self.state.clone() + state_step.clone()
@@ -136,6 +141,7 @@ def positions_to_images(positions,
 #TODO : image not triangular - reshape issue?
 if __name__ == "__main__":
     import tqdm
+    import matplotlib.pyplot as plt
     import torchvision
 
     network_width = 32
@@ -145,10 +151,13 @@ if __name__ == "__main__":
 
     save_rate = n_steps // (n_sec * fps)
     step_size = 0.5 # ms
+    time_constant = 10
     noise_scale = 0.001
 
     with torch.no_grad():
-        can = CAN(network_width, periodic=False)
+        can = CAN(network_width,
+                  tau = time_constant,
+                  periodic=False)
         x = torch.tensor([0, 0], dtype = torch.float32)
         velocity = torch.tensor([0, 0], dtype = torch.float32)
         frames = []
@@ -160,12 +169,12 @@ if __name__ == "__main__":
                 frames.append(state.reshape(network_width, network_width))
                 frames_x.append(x.clone())
             # use sin and cos so velocity is an expanding spiral
-            r = math.sqrt(i) * noise_scale
+            r = math.sqrt(i) * step_size
             velocity = torch.tensor([r * math.cos(i * 0.01),
                                      r * math.sin(i * 0.01)],
                                      dtype = torch.float32)
             # add small jitter
-            velocity += torch.randn(2) * noise_scale
+            velocity += torch.randn(2) * step_size
 
     frames = torch.stack(frames)
     frames_x = torch.stack(frames_x)
@@ -188,6 +197,11 @@ if __name__ == "__main__":
                         frames_x],
                         dim = -2)
     torchvision.io.write_video("can.mp4", frames, fps = fps)
+
+    # save heatmap of weights with imshow
+    plt.imshow(can.weights.numpy())
+    plt.colorbar()
+    plt.savefig("weights.png")
 
 
 
