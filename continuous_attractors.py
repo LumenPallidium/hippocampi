@@ -8,9 +8,10 @@ class CAN(torch.nn.Module):
                  delta_r = None,
                  n_axes = 2,
                  a = 1,
-                 lambda_net = 13,
-                 l = 2,
-                 alpha = 0.10315,
+                 lambda_net = 12,
+                 l = 1,
+                 alpha = 0.0010315,
+                 envelope_scale = 4,
                  tau = 0.001,
                  activation = torch.nn.ReLU()):
         super().__init__()
@@ -22,6 +23,7 @@ class CAN(torch.nn.Module):
         self.l = l
         self.periodic = periodic
         self.alpha = alpha
+        self.envelope_scale = envelope_scale
         # time constant in ms
         self.tau = tau
 
@@ -46,7 +48,7 @@ class CAN(torch.nn.Module):
         self.directions = directions.repeat(n_repeats, 1)
 
         self.weights, self.neuron_grid = self._generate_weights()
-        self.state = torch.randn(self.length * self.length)
+        self.state = torch.randn(self.length * self.length) / (self.length ** 2)
         self.activation = activation
         self.envelope = self._get_envelope()
 
@@ -56,7 +58,7 @@ class CAN(torch.nn.Module):
         # set to 1 if negative
         length_ratio = torch.maximum(length_ratio, torch.zeros_like(length_ratio))
         length_ratio /= self.delta_r
-        envelope = torch.exp(-4 * length_ratio ** 2) 
+        envelope = torch.exp(-self.envelope_scale * (length_ratio ** 2))
         return envelope
     
     def center_surround(self, x):
@@ -76,7 +78,7 @@ class CAN(torch.nn.Module):
                                   dim = -1)
         neuron_grid = neuron_grid.reshape(-1, 2).float() # Nx2
         neuron_grid_vector = neuron_grid.clone()
-        shifted_grid = neuron_grid - (self.l * self.directions)
+        shifted_grid = neuron_grid + (self.l * self.directions)
         distances = torch.cdist(neuron_grid,
                                 shifted_grid,
                                 p = 1)**2
@@ -99,7 +101,9 @@ class CAN(torch.nn.Module):
         b = 1 + self.alpha * b
         if not self.periodic:
             b *= self.envelope
-        state = self.weights.T @ self.state.clone()
+        state = torch.einsum("ij,j->i",
+                             self.weights,
+                             self.state)
         state = self.activation(state + b)
         state_step = step_size * (state - self.state.clone()) / self.tau
         new_state = self.state.clone() + state_step.clone()
@@ -144,19 +148,21 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import torchvision
 
-    network_width = 32
+    network_width = 64
     n_steps = 10000
     fps = 30
     n_sec = 20
-
-    save_rate = n_steps // (n_sec * fps)
     step_size = 0.5 # ms
     time_constant = 10
     noise_scale = 0.001
+    burn_in = int(1 / step_size)
 
+    save_rate = (n_steps - burn_in) // (n_sec * fps)
+    
     with torch.no_grad():
         can = CAN(network_width,
                   tau = time_constant,
+                  l=2,
                   periodic=False)
         x = torch.tensor([0, 0], dtype = torch.float32)
         velocity = torch.tensor([0, 0], dtype = torch.float32)
@@ -165,7 +171,7 @@ if __name__ == "__main__":
         for i in tqdm.trange(n_steps):
             state = can(velocity, step_size = step_size).clone()
             x += velocity * step_size
-            if (i != 0) & (i % save_rate == 0):
+            if (i >= burn_in) & (i % save_rate == 0):
                 frames.append(state.reshape(network_width, network_width))
                 frames_x.append(x.clone())
             # use sin and cos so velocity is an expanding spiral
