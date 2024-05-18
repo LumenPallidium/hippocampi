@@ -6,11 +6,12 @@ class CAN(torch.nn.Module):
                  length,
                  periodic = True,
                  delta_r = None,
+                 warmup_steps = 1000,
                  n_axes = 2,
                  a = 1,
                  lambda_net = 12,
                  l = 1,
-                 alpha = 0.0010315,
+                 alpha = 0.10315,
                  envelope_scale = 4,
                  tau = 0.001,
                  activation = torch.nn.ReLU()):
@@ -22,6 +23,8 @@ class CAN(torch.nn.Module):
         self.gamma = 1.05 * self.beta
         self.l = l
         self.periodic = periodic
+        self.warmup = 0
+        self.warmup_steps = warmup_steps
         self.alpha = alpha
         self.envelope_scale = envelope_scale
         # time constant in ms
@@ -54,7 +57,10 @@ class CAN(torch.nn.Module):
 
     def _get_envelope(self):
         half_length = self.length // 2
-        length_ratio = (self.neuron_grid.norm(dim = 1) - half_length + self.delta_r)
+        grid_mag = torch.linalg.vector_norm(self.neuron_grid,
+                                            ord = 2,
+                                            dim = -1)
+        length_ratio = (grid_mag - half_length + self.delta_r)
         # set to 1 if negative
         length_ratio = torch.maximum(length_ratio, torch.zeros_like(length_ratio))
         length_ratio /= self.delta_r
@@ -82,9 +88,10 @@ class CAN(torch.nn.Module):
         distances = torch.cdist(neuron_grid,
                                 shifted_grid,
                                 p = 1)**2
-        if self.periodic:
+        if self.periodic and self.warmup > 0:
             # distances with periodic boundary, thanks Claude
-            distances = torch.remainder(distances + half_length, 2 * half_length) - half_length
+            distances = torch.remainder(distances + half_length,
+                                        2 * half_length) - half_length
         # NxNx2 -> NxN, 1 norm as in paper
         # distances = (distances ** 2).sum(dim = -1)
 
@@ -99,8 +106,13 @@ class CAN(torch.nn.Module):
                          self.directions,
                          velocity)
         b = 1 + self.alpha * b
-        if not self.periodic:
+        if (not self.periodic) or (self.warmup < self.warmup_steps):
+            self.warmup += 1
             b *= self.envelope
+        elif (self.warmup == self.warmup_steps):
+            self.warmup += 1
+            # regenerate weights after warmup
+            self._generate_weights()
         state = torch.einsum("ij,j->i",
                              self.weights,
                              self.state)
@@ -113,6 +125,7 @@ class CAN(torch.nn.Module):
 def positions_to_images(positions,
                         energies = None,
                         out_size = None,
+                        length = None,
                         diameter = 1):
     """
     Convert a list of positions to images
@@ -120,7 +133,8 @@ def positions_to_images(positions,
     left_corner = positions.min(dim = 0).values
 
     positions = positions - left_corner
-    length = positions.max().ceil() + 1
+    if length is None:
+        length = positions.max().ceil() + 1
     if out_size is not None:
         positions = positions / length
         length = out_size
@@ -149,38 +163,52 @@ if __name__ == "__main__":
     import torchvision
 
     network_width = 64
-    n_steps = 10000
+    warmup = 0
+    n_steps = 10000 + warmup
     fps = 30
-    n_sec = 20
+    n_sec = 30
     step_size = 0.5 # ms
     time_constant = 10
     noise_scale = 0.001
-    burn_in = int(1 / step_size)
+    burn_in = int(1 / step_size) + warmup
+
+    box_length = 2
 
     save_rate = (n_steps - burn_in) // (n_sec * fps)
     
     with torch.no_grad():
         can = CAN(network_width,
+                  warmup_steps = warmup,
                   tau = time_constant,
-                  l=2,
-                  periodic=False)
-        x = torch.tensor([0, 0], dtype = torch.float32)
+                  envelope_scale= 4,
+                  periodic = False)
+        x = torch.tensor([box_length / 2,
+                          box_length / 2],
+                         dtype = torch.float32)
         velocity = torch.tensor([0, 0], dtype = torch.float32)
         frames = []
         frames_x = []
         for i in tqdm.trange(n_steps):
             state = can(velocity, step_size = step_size).clone()
             x += velocity * step_size
+
+            # check if x is outside box
+            above_box = (x.abs() >= box_length)
+            below_box = (x <= 0)
+            if above_box.any():
+                # slow and bounce off walls
+                velocity[above_box] *= -0.7
+                # reset to box
+                x[above_box] = box_length
+            if below_box.any():
+                velocity[below_box] *= -0.7
+                x[below_box] = 0
+
             if (i >= burn_in) & (i % save_rate == 0):
                 frames.append(state.reshape(network_width, network_width))
                 frames_x.append(x.clone())
-            # use sin and cos so velocity is an expanding spiral
-            r = math.sqrt(i) * step_size
-            velocity = torch.tensor([r * math.cos(i * 0.01),
-                                     r * math.sin(i * 0.01)],
-                                     dtype = torch.float32)
             # add small jitter
-            velocity += torch.randn(2) * step_size
+            velocity += torch.randn(2) * step_size * noise_scale
 
     frames = torch.stack(frames)
     frames_x = torch.stack(frames_x)
@@ -191,6 +219,7 @@ if __name__ == "__main__":
 
     frames_x = positions_to_images(frames_x,
                                    energies,
+                                   length = box_length,
                                    out_size = network_width)
 
     
