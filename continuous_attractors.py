@@ -9,8 +9,8 @@ class CAN(torch.nn.Module):
                  warmup_steps = 1000,
                  n_axes = 2,
                  a = 1,
-                 lambda_net = 12,
-                 l = 1,
+                 lambda_net = 13,
+                 l = 2,
                  alpha = 0.10315,
                  envelope_scale = 4,
                  tau = 0.001,
@@ -20,7 +20,7 @@ class CAN(torch.nn.Module):
         self.a = a
         self.lambda_net = lambda_net
         self.beta = 3 / (lambda_net ** 2)
-        self.gamma = 1.05 * self.beta
+        self.gamma = 1.2 * self.beta
         self.l = l
         self.periodic = periodic
         self.warmup = 0
@@ -60,7 +60,7 @@ class CAN(torch.nn.Module):
         grid_mag = torch.linalg.vector_norm(self.neuron_grid,
                                             ord = 2,
                                             dim = -1)
-        length_ratio = (grid_mag - half_length + self.delta_r)
+        length_ratio = (grid_mag - self.length + self.delta_r)
         # set to 1 if negative
         length_ratio = torch.maximum(length_ratio, torch.zeros_like(length_ratio))
         length_ratio /= self.delta_r
@@ -87,15 +87,13 @@ class CAN(torch.nn.Module):
         shifted_grid = neuron_grid + (self.l * self.directions)
         distances = torch.cdist(neuron_grid,
                                 shifted_grid,
-                                p = 1)**2
+                                p = 1)
         if self.periodic and self.warmup > 0:
             # distances with periodic boundary, thanks Claude
             distances = torch.remainder(distances + half_length,
                                         2 * half_length) - half_length
-        # NxNx2 -> NxN, 1 norm as in paper
-        # distances = (distances ** 2).sum(dim = -1)
 
-        weights = self.center_surround(distances)
+        weights = self.center_surround(distances**2)
         return weights, neuron_grid_vector
     
     def forward(self, velocity, step_size = 0.5):
@@ -130,10 +128,9 @@ def positions_to_images(positions,
     """
     Convert a list of positions to images
     """
-    left_corner = positions.min(dim = 0).values
-
-    positions = positions - left_corner
     if length is None:
+        left_corner = positions.min(dim = 0).values
+        positions = positions - left_corner
         length = positions.max().ceil() + 1
     if out_size is not None:
         positions = positions / length
@@ -157,6 +154,7 @@ def positions_to_images(positions,
     return image
     
 #TODO : image not triangular - reshape issue?
+#TODO : velocity no longer shifting state
 if __name__ == "__main__":
     import tqdm
     import matplotlib.pyplot as plt
@@ -164,12 +162,12 @@ if __name__ == "__main__":
 
     network_width = 64
     warmup = 0
-    n_steps = 10000 + warmup
+    n_steps = 20000 + warmup
     fps = 30
-    n_sec = 30
-    step_size = 0.5 # ms
-    time_constant = 10
-    noise_scale = 0.001
+    step_size = 0.0005 # ms
+    time_constant = 0.010
+    lambda_net = 13
+    n_sec = int(n_steps * step_size)
     burn_in = int(1 / step_size) + warmup
 
     box_length = 2
@@ -180,12 +178,14 @@ if __name__ == "__main__":
         can = CAN(network_width,
                   warmup_steps = warmup,
                   tau = time_constant,
+                  lambda_net = lambda_net,
                   envelope_scale= 4,
                   periodic = False)
         x = torch.tensor([box_length / 2,
                           box_length / 2],
                          dtype = torch.float32)
         velocity = torch.tensor([0, 0], dtype = torch.float32)
+        ewma_velocity = velocity.clone()
         frames = []
         frames_x = []
         for i in tqdm.trange(n_steps):
@@ -207,8 +207,12 @@ if __name__ == "__main__":
             if (i >= burn_in) & (i % save_rate == 0):
                 frames.append(state.reshape(network_width, network_width))
                 frames_x.append(x.clone())
-            # add small jitter
-            velocity += torch.randn(2) * step_size * noise_scale
+            # add small jitter, with reinforcement to existing velocity
+            ewma_velocity = 0.85 * torch.randn(2) + 0.15 * ewma_velocity.clone()
+            velocity += ewma_velocity * step_size
+            # make sure absolute velocity is not higher than 1
+            velocity = torch.minimum(velocity, torch.ones(2))
+            velocity = torch.maximum(velocity, -torch.ones(2))
 
     frames = torch.stack(frames)
     frames_x = torch.stack(frames_x)
