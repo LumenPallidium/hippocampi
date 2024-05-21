@@ -2,6 +2,40 @@ import torch
 import math
 
 class CAN(torch.nn.Module):
+    """
+    A continuous attractor network as described in the paper
+    "Accurate Path Integration in Continuous Attractor Network Models of Grid Cells".
+    This models the grid cells of the Hippocampul-entorhinal system, inclduing
+    their velocity response.
+    
+
+    Parameters
+    ----------
+    length : int
+        The length of the network, which is a square.
+    periodic : bool
+        Whether to use periodic boundary conditions.
+    delta_r : float
+        Scaling of the envelope, higher values make the envelope more narrow.
+    warmup_steps : int
+        Number of steps to warm up the network.
+    n_axes : int
+        Number of axes in the network (default 2 = 4 head directions)
+    a : float
+        Parameter for the center surround function, >1 means net excitation.
+    lambda_net : float
+        Effective diameter of network.
+    l : float
+        Shift amount of grid (tunes velocity response)
+    alpha : float
+        Gain due to velocity, alpha * v should be less than 1
+    envelope_scale : float
+        Scaling of the envelope, higher values make the envelope more narrow.
+    tau : float
+        Time constant of the network.
+    activation : torch.nn.Module
+        Activation function to use.
+    """
     def __init__(self,
                  length,
                  periodic = True,
@@ -56,7 +90,9 @@ class CAN(torch.nn.Module):
         self.envelope = self._get_envelope()
 
     def _get_envelope(self):
-        half_length = self.length // 2
+        """
+        Envelope function from paper
+        """
         grid_mag = torch.linalg.vector_norm(self.neuron_grid,
                                             ord = 2,
                                             dim = -1)
@@ -77,7 +113,9 @@ class CAN(torch.nn.Module):
     
     # TODO : look into convolutions for efficiency
     def _generate_weights(self):
-
+        """
+        Generate the weights using distances and center surround function.
+        """
         half_length = self.length // 2
         neuron_grid = torch.stack(torch.meshgrid(torch.arange(-half_length, half_length),
                                                  torch.arange(-half_length, half_length)),
@@ -150,7 +188,6 @@ def positions_to_images(positions,
                                                                               torch.zeros(1)) * 100
             image[i:, x:(x + diameter), y:(y + diameter), 2] += torch.maximum(-energy,
                                                                               torch.zeros(1)) * 100
-
     return image
     
 #TODO : image not triangular - reshape issue?
@@ -162,7 +199,7 @@ if __name__ == "__main__":
 
     network_width = 64
     warmup = 0
-    n_steps = 20000 + warmup
+    n_steps = 100000 + warmup
     fps = 30
     step_size = 0.0005 # ms
     time_constant = 0.010
@@ -208,7 +245,7 @@ if __name__ == "__main__":
                 frames.append(state.reshape(network_width, network_width))
                 frames_x.append(x.clone())
             # add small jitter, with reinforcement to existing velocity
-            ewma_velocity = 0.85 * torch.randn(2) + 0.15 * ewma_velocity.clone()
+            ewma_velocity = 0.9 * torch.randn(2) + 0.1 * ewma_velocity.clone()
             velocity += ewma_velocity * step_size
             # make sure absolute velocity is not higher than 1
             velocity = torch.minimum(velocity, torch.ones(2))
