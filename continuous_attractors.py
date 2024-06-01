@@ -47,7 +47,7 @@ class CAN(torch.nn.Module):
                  l = 2,
                  alpha = 0.10315,
                  envelope_scale = 4,
-                 tau = 0.001,
+                 tau = 0.01,
                  activation = torch.nn.ReLU()):
         super().__init__()
         # parameters from paper, see methods
@@ -125,7 +125,7 @@ class CAN(torch.nn.Module):
         shifted_grid = neuron_grid + (self.l * self.directions)
         distances = torch.cdist(neuron_grid,
                                 shifted_grid,
-                                p = 1)
+                                p = 2)
         if self.periodic and self.warmup > 0:
             # distances with periodic boundary, thanks Claude
             distances = torch.remainder(distances + half_length,
@@ -162,7 +162,7 @@ def positions_to_images(positions,
                         energies = None,
                         out_size = None,
                         length = None,
-                        diameter = 1):
+                        diameter = 8):
     """
     Convert a list of positions to images
     """
@@ -185,9 +185,9 @@ def positions_to_images(positions,
             # 0 energy is blue, 1 is red
             energy = (energies[i] - 0.5) * 2
             image[i:, x:(x + diameter), y:(y + diameter), 0] += torch.maximum(energy,
-                                                                              torch.zeros(1)) * 100
+                                                                              torch.zeros(1)) * 60
             image[i:, x:(x + diameter), y:(y + diameter), 2] += torch.maximum(-energy,
-                                                                              torch.zeros(1)) * 100
+                                                                              torch.zeros(1)) * 60
     return image
     
 #TODO : image not triangular - reshape issue?
@@ -198,25 +198,29 @@ if __name__ == "__main__":
     import torchvision
 
     network_width = 64
+    vid_size = 480
     warmup = 0
-    n_steps = 100000 + warmup
-    fps = 30
-    step_size = 0.0005 # ms
+    n_steps = 200000 + warmup
+    fps = 60
+    step_size = 0.001 # ms
     time_constant = 0.010
     lambda_net = 13
-    n_sec = int(n_steps * step_size)
+    envelope_scale = 4
+    n_sec = min(int(n_steps * step_size), 30)
     burn_in = int(1 / step_size) + warmup
 
     box_length = 2
 
     save_rate = (n_steps - burn_in) // (n_sec * fps)
+
+    i_matrix = torch.tensor([[0, 1], [-1, 0]], dtype = torch.float32)
     
     with torch.no_grad():
         can = CAN(network_width,
                   warmup_steps = warmup,
                   tau = time_constant,
                   lambda_net = lambda_net,
-                  envelope_scale= 4,
+                  envelope_scale= envelope_scale,
                   periodic = False)
         x = torch.tensor([box_length / 2,
                           box_length / 2],
@@ -244,8 +248,8 @@ if __name__ == "__main__":
             if (i >= burn_in) & (i % save_rate == 0):
                 frames.append(state.reshape(network_width, network_width))
                 frames_x.append(x.clone())
-            # add small jitter, with reinforcement to existing velocity
-            ewma_velocity = 0.9 * torch.randn(2) + 0.1 * ewma_velocity.clone()
+            # add small jitter, with reinforcement to rotating existing velocity
+            ewma_velocity = 0.6 * torch.randn(2) + 0.4 * (i_matrix @ ewma_velocity.clone())
             velocity += ewma_velocity * step_size
             # make sure absolute velocity is not higher than 1
             velocity = torch.minimum(velocity, torch.ones(2))
@@ -254,19 +258,26 @@ if __name__ == "__main__":
     frames = torch.stack(frames)
     frames_x = torch.stack(frames_x)
     #energies = torch.norm(frames, dim = (-1, -2))
-    # select single neuron
-    energies = frames[:, 0, 0]
+    # select central neurons
+    midpoint = network_width // 2
+    energies = frames[:,
+                      (midpoint - 2):(midpoint + 2),
+                      (midpoint - 2):(midpoint + 2),].mean(dim = (-1, -2))
     energies = (energies - energies.min()) / (energies.max() - energies.min())
 
     frames_x = positions_to_images(frames_x,
                                    energies,
                                    length = box_length,
-                                   out_size = network_width)
+                                   out_size = vid_size)
 
     
     # convert to uint8 for video
     frames = (frames - frames.min()) / (frames.max() - frames.min())
-    frames = (frames * 255).to(torch.uint8).unsqueeze(-1).repeat(1, 1, 1, 3)
+    # interpolate frames to vid_size
+    frames = torch.nn.functional.interpolate(frames.unsqueeze(1),
+                                             size = (vid_size, vid_size),
+                                             mode = "bilinear")
+    frames = (frames * 255).to(torch.uint8).repeat(1, 3, 1, 1).permute(0, 2, 3, 1)
 
     # append x position to frames
     frames = torch.cat([frames,
