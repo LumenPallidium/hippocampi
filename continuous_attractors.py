@@ -63,6 +63,7 @@ class CAN(torch.nn.Module):
         self.envelope_scale = envelope_scale
         # time constant in ms
         self.tau = tau
+        self.activation = activation
 
         if delta_r is None:
             delta_r = length
@@ -78,16 +79,22 @@ class CAN(torch.nn.Module):
 
         directions = torch.tensor([[math.cos(angle),
                                     math.sin(angle)] for angle in self.angles],
-                                       dtype = torch.float32)
+                                  dtype = torch.float32)
         # rounding to avoid floating point errors
         directions = torch.round(directions * 1e4) / 1e4
         n_repeats = (length ** 2) // (self.n_axes ** 2)
-        self.directions = directions.repeat(n_repeats, 1)
+        directions = directions.repeat(n_repeats, 1)
+        # register as buffer cause no grad but we want saving, devices etc
+        self.register_buffer("directions", directions)
 
-        self.weights, self.neuron_grid = self._generate_weights()
-        self.state = torch.randn(self.length * self.length) / (self.length ** 2)
-        self.activation = activation
-        self.envelope = self._get_envelope()
+        weights, neuron_grid = self._generate_weights()
+        self.register_buffer("weights", weights)
+        self.register_buffer("neuron_grid", neuron_grid)
+
+        state = torch.randn(self.length * self.length) / (self.length ** 2)
+        envelope = self._get_envelope()
+        self.register_buffer("state", state)
+        self.register_buffer("envelope", envelope)
 
     def _get_envelope(self):
         """
@@ -166,6 +173,7 @@ def positions_to_images(positions,
     """
     Convert a list of positions to images
     """
+    device = positions.device
     if length is None:
         left_corner = positions.min(dim = 0).values
         positions = positions - left_corner
@@ -174,7 +182,8 @@ def positions_to_images(positions,
         positions = positions / length
         length = out_size
     image = torch.zeros(positions.shape[0],
-                        length, length, 3)
+                        length, length, 3,
+                        device = device)
     for i, (x, y) in enumerate(positions):
         x = int(x * length)
         y = int(y * length)
@@ -185,9 +194,11 @@ def positions_to_images(positions,
             # 0 energy is blue, 1 is red
             energy = (energies[i] - 0.5) * 2
             image[i:, x:(x + diameter), y:(y + diameter), 0] += torch.maximum(energy,
-                                                                              torch.zeros(1)) * 60
+                                                                              torch.zeros(1,
+                                                                                          device = device)) * 60
             image[i:, x:(x + diameter), y:(y + diameter), 2] += torch.maximum(-energy,
-                                                                              torch.zeros(1)) * 60
+                                                                              torch.zeros(1,
+                                                                                          device = device)) * 60
     return image
     
 #TODO : image not triangular - reshape issue?
@@ -200,20 +211,23 @@ if __name__ == "__main__":
     network_width = 64
     vid_size = 480
     warmup = 0
-    n_steps = 200000 + warmup
+    n_steps = 400000 + warmup
     fps = 60
-    step_size = 0.001 # ms
+    step_size = 0.002 # ms
     time_constant = 0.010
     lambda_net = 13
-    envelope_scale = 4
-    n_sec = min(int(n_steps * step_size), 30)
+    envelope_scale = 12
+    n_sec = min(int(n_steps * step_size), 60)
     burn_in = int(1 / step_size) + warmup
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     box_length = 2
 
     save_rate = (n_steps - burn_in) // (n_sec * fps)
 
-    i_matrix = torch.tensor([[0, 1], [-1, 0]], dtype = torch.float32)
+    i_matrix = torch.tensor([[0, 1], [-1, 0]],
+                            dtype = torch.float32,
+                            device = device)
     
     with torch.no_grad():
         can = CAN(network_width,
@@ -221,11 +235,13 @@ if __name__ == "__main__":
                   tau = time_constant,
                   lambda_net = lambda_net,
                   envelope_scale= envelope_scale,
-                  periodic = False)
+                  periodic = False).to(device)
         x = torch.tensor([box_length / 2,
                           box_length / 2],
-                         dtype = torch.float32)
-        velocity = torch.tensor([0, 0], dtype = torch.float32)
+                         dtype = torch.float32).to(device)
+        velocity = torch.tensor([0, 0],
+                                dtype = torch.float32,
+                                device = device)
         ewma_velocity = velocity.clone()
         frames = []
         frames_x = []
@@ -249,11 +265,11 @@ if __name__ == "__main__":
                 frames.append(state.reshape(network_width, network_width))
                 frames_x.append(x.clone())
             # add small jitter, with reinforcement to rotating existing velocity
-            ewma_velocity = 0.6 * torch.randn(2) + 0.4 * (i_matrix @ ewma_velocity.clone())
+            ewma_velocity = 0.6 * torch.randn(2, device = device) + 0.4 * (i_matrix @ ewma_velocity.clone())
             velocity += ewma_velocity * step_size
             # make sure absolute velocity is not higher than 1
-            velocity = torch.minimum(velocity, torch.ones(2))
-            velocity = torch.maximum(velocity, -torch.ones(2))
+            velocity = torch.minimum(velocity, torch.ones(2, device = device))
+            velocity = torch.maximum(velocity, -torch.ones(2, device = device))
 
     frames = torch.stack(frames)
     frames_x = torch.stack(frames_x)
@@ -270,7 +286,6 @@ if __name__ == "__main__":
                                    length = box_length,
                                    out_size = vid_size)
 
-    
     # convert to uint8 for video
     frames = (frames - frames.min()) / (frames.max() - frames.min())
     # interpolate frames to vid_size
@@ -282,11 +297,11 @@ if __name__ == "__main__":
     # append x position to frames
     frames = torch.cat([frames,
                         frames_x],
-                        dim = -2)
+                        dim = -2).cpu().numpy()
     torchvision.io.write_video("can.mp4", frames, fps = fps)
 
     # save heatmap of weights with imshow
-    plt.imshow(can.weights.numpy())
+    plt.imshow(can.weights.cpu().detach().numpy())
     plt.colorbar()
     plt.savefig("weights.png")
 
