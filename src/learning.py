@@ -1,5 +1,4 @@
 import torch
-import math
 
 def hebbian_pseudoinverse(weight, inhibition_matrix, x, y):
     """

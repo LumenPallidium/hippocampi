@@ -1,5 +1,6 @@
 import torch
 from tqdm import tqdm
+from learning import hebbian_pseudoinverse, hebbian_pca
 
 class NestedGrid(torch.nn.Module):
     """
@@ -74,12 +75,21 @@ class NestedGrid(torch.nn.Module):
         grids = x.split(self.grid_sizes.tolist(), dim = -1)
         if run_wta:
             indices = torch.stack([grid.flatten().argmax() for grid in grids])
-
-            onehot_vec = torch.zeros(self.dim)
-            onehot_vec[indices] = 1
+            onehot_vec = self.indices_to_onehot(indices)
 
             return onehot_vec, indices
         return grids
+    
+    def indices_to_onehot(self, indices):
+        """
+        Convert the indices of the grid to a one-hot vector.
+        Parameters:
+        ----------
+        indices (tensor): The indices of the grid.
+        """
+        onehot_vec = torch.zeros(self.dim)
+        onehot_vec[indices] = 1
+        return onehot_vec
     
 
 class VectorHaSH(torch.nn.Module):
@@ -142,8 +152,12 @@ class VectorHaSH(torch.nn.Module):
 
         if S is not None:
             H = torch.stack(H)
-            W_hs = H.T @ torch.pinverse(S)
-            W_sh = S @ torch.pinverse(H).T
+
+            S_inv = torch.linalg.lstsq(S, torch.eye(S.shape[0])).solution
+            H_inv = torch.linalg.lstsq(H, torch.eye(H.shape[0])).solution
+
+            W_hs = H.T @ S_inv
+            W_sh = S @ H_inv.T
         else:
             W_hs = torch.randn(self.s_dim, self.h_dim)
             W_sh = torch.randn(self.h_dim, self.s_dim)
@@ -154,7 +168,7 @@ class VectorHaSH(torch.nn.Module):
     def forward(self, sense):
         """
         Give a sensory input, return where that memory is "placed" in the grid.
-        
+
         Parameters:
         ----------
         sense (tensor): The sensory input to the model.
@@ -165,6 +179,67 @@ class VectorHaSH(torch.nn.Module):
         self.grid.indices = indices
 
         return onehot, indices
+    
+    def recall_sense(self, indices):
+        """
+        Recall a sensory input from the grid indices.
+
+        Parameters:
+        ----------
+        indices (tensor): The indices of the grid to recall the sensory input from.
+        """
+        self.grid.indices = torch.tensor(indices)
+        onehot = self.grid.indices_to_onehot(self.grid.indices)
+        self.h = torch.nn.functional.relu(self.W_hg @ onehot - self.theta)
+        return self.W_sh @ self.h
+    
+def location_recall_test(n_test, S, vhash, s_dim, n_pats):
+    print("Testing...")
+    sleep(0.1)
+    success = 0
+    pbar = tqdm(range(n_test))
+    for i in range(n_test):
+        rand_idx = np.random.randint(0, n_pats)
+        pattern = S[:, rand_idx]
+        rand_idx_grid = [(rand_idx // vhash.grid.grid_sizes[:j].prod().item()) % vhash.grid.sizes[j] for j in range(vhash.grid.n)]
+
+        onehot, idx = vhash(pattern)
+
+        if torch.all(idx == torch.tensor(rand_idx_grid)):
+            success += 1
+
+        pbar.set_description(f"Success rate: {success / (i + 1):.2f}")
+        pbar.update(1)
+
+    pbar.close()
+    # this will be ~~ s_dim / n_pats
+    print(f"Done! Final success rate: {success / n_test:.2f}")
+    print(f"Expected success rate: {min(1, s_dim / n_pats):.2f}")
+
+def pattern_recall_test(n_test, S, vhash, n_pats):
+    print("Testing...")
+    sleep(0.1)
+    dists = []
+    pbar = tqdm(range(n_test))
+
+    exemplar = torch.randn(vhash.s_dim)
+
+    for i in range(n_test):
+        rand_idx = np.random.randint(0, n_pats)
+        pattern = S[:, rand_idx]
+        rand_idx_grid = [(rand_idx // vhash.grid.grid_sizes[:j].prod().item()) % vhash.grid.sizes[j] for j in range(vhash.grid.n)]
+
+        s_hat = vhash.recall_sense(rand_idx_grid)
+
+        dist = ((s_hat - pattern)**2).mean()
+        dists.append(dist)
+
+        exemplar_dist = ((s_hat - exemplar)**2).mean()
+
+        pbar.set_description(f"Avg Dist: {np.mean(dists):.2f} (Exemplar Dist : {exemplar_dist:.2f})")
+        pbar.update(1)
+
+    pbar.close()
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
@@ -174,30 +249,13 @@ if __name__ == "__main__":
     n_pats = np.prod(sizes)**2
     n_test = 100
     s_dim = 256
-    h_dim = 32
+    h_dim = 64
     with torch.no_grad():
-        S = torch.randn(s_dim, n_pats) * 2
+        S = torch.randn(s_dim, n_pats)
 
         vhash = VectorHaSH(s_dim, h_dim, sizes = sizes, S = S)
 
-        print("Testing...")
-        sleep(0.1)
-        success = 0
-        pbar = tqdm(range(n_test))
-        for i in range(n_test):
-            rand_idx = np.random.randint(0, n_pats)
-            pattern = S[:, rand_idx]
-            rand_idx_grid = [(rand_idx // vhash.grid.grid_sizes[:j].prod().item()) % vhash.grid.sizes[j] for j in range(vhash.grid.n)]
+        location_recall_test(n_test, S, vhash, s_dim, n_pats)
+        pattern_recall_test(n_test, S, vhash, n_pats)
 
-            onehot, idx = vhash(pattern)
 
-            if torch.all(idx == torch.tensor(rand_idx_grid)):
-                success += 1
-
-            pbar.set_description(f"Success rate: {success / (i + 1):.2f}")
-            pbar.update(1)
-
-        pbar.close()
-    # this will be ~~ s_dim / n_pats
-    print(f"Done! Final success rate: {success / n_test:.2f}")
-    print(f"Expected success rate: {max(1, s_dim / n_pats):.2f}")
