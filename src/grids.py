@@ -137,6 +137,8 @@ class VectorHaSH(torch.nn.Module):
 
         W_gh = torch.zeros(self.g_dim, self.h_dim)
         grid_prod = self.grid.grid_sizes.prod().item()
+        if S is not None:
+            grid_prod = S.shape[1]
         H = []
         for i in tqdm(range(grid_prod)):
             indices = [(i // self.grid.grid_sizes[:j].prod().item()) % self.grid.sizes[j] for j in range(self.grid.n)]
@@ -151,13 +153,13 @@ class VectorHaSH(torch.nn.Module):
         self.register_buffer("W_gh", W_gh)
 
         if S is not None:
-            H = torch.stack(H)
+            H = torch.stack(H).T
 
             S_inv = torch.linalg.lstsq(S, torch.eye(S.shape[0])).solution
             H_inv = torch.linalg.lstsq(H, torch.eye(H.shape[0])).solution
 
-            W_hs = H.T @ S_inv
-            W_sh = S @ H_inv.T
+            W_hs = H @ S_inv
+            W_sh = S @ H_inv
         else:
             W_hs = torch.randn(self.s_dim, self.h_dim)
             W_sh = torch.randn(self.h_dim, self.s_dim)
@@ -194,6 +196,7 @@ class VectorHaSH(torch.nn.Module):
         return self.W_sh @ self.h
     
 def location_recall_test(n_test, S, vhash, s_dim, n_pats):
+    from time import sleep
     print("Testing...")
     sleep(0.1)
     success = 0
@@ -216,7 +219,11 @@ def location_recall_test(n_test, S, vhash, s_dim, n_pats):
     print(f"Done! Final success rate: {success / n_test:.2f}")
     print(f"Expected success rate: {min(1, s_dim / n_pats):.2f}")
 
-def pattern_recall_test(n_test, S, vhash, n_pats):
+def pattern_recall_test(n_test, S, vhash, n_pats,
+                        out_im_height = 5,
+                        imshape = (28, 28)):
+    import matplotlib.pyplot as plt
+    from time import sleep
     print("Testing...")
     sleep(0.1)
     dists = []
@@ -224,6 +231,7 @@ def pattern_recall_test(n_test, S, vhash, n_pats):
 
     exemplar = torch.randn(vhash.s_dim)
 
+    im_pairs = []
     for i in range(n_test):
         rand_idx = np.random.randint(0, n_pats)
         pattern = S[:, rand_idx]
@@ -239,20 +247,41 @@ def pattern_recall_test(n_test, S, vhash, n_pats):
         pbar.set_description(f"Avg Dist: {np.mean(dists):.2f} (Exemplar Dist : {exemplar_dist:.2f})")
         pbar.update(1)
 
+        im_pair = torch.concat([pattern.view(*imshape),
+                                s_hat.view(*imshape)],
+                                dim = 0)
+
+        im_pairs.append(im_pair)
+        
     pbar.close()
+
+    display_ims = im_pairs[-out_im_height:]
+    display_ims = torch.concat(display_ims, dim = -1)
+
+    plt.imshow(display_ims.cpu().numpy())
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import numpy as np
-    from time import sleep
+    from torchvision import datasets, transforms
+
     sizes = [3, 5]
     n_pats = np.prod(sizes)**2
     n_test = 100
-    s_dim = 256
-    h_dim = 64
-    with torch.no_grad():
-        S = torch.randn(s_dim, n_pats)
+    s_dim = 784
+    h_dim = 32
 
+    transform = transforms.Compose([transforms.ToTensor(),
+                                transforms.Lambda(lambda x: x.view(-1))])
+
+    mnist = datasets.MNIST("data/", train=True,
+                           download=True, transform = transform)
+
+
+    dl = iter(torch.utils.data.DataLoader(mnist, batch_size = int(n_pats)))
+    S =  next(dl)[0].T
+
+    with torch.no_grad():
         vhash = VectorHaSH(s_dim, h_dim, sizes = sizes, S = S)
 
         location_recall_test(n_test, S, vhash, s_dim, n_pats)

@@ -163,7 +163,7 @@ cython_debug/
 /data
 /models
 /videos
-/backprop_alts/experiments.py
+/src/data
 
 # data files
 *.csv
