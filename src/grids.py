@@ -1,6 +1,6 @@
 import torch
 from tqdm import tqdm
-from learning import hebbian_pseudoinverse, hebbian_pca
+from modules import MNISTAutoEncoder, mnist_sae_train
 
 class NestedGrid(torch.nn.Module):
     """
@@ -74,21 +74,37 @@ class NestedGrid(torch.nn.Module):
         """
         grids = x.split(self.grid_sizes.tolist(), dim = -1)
         if run_wta:
-            indices = torch.stack([grid.flatten().argmax() for grid in grids])
+            indices = torch.tensor([grid.flatten().argmax() for grid in grids])
             onehot_vec = self.indices_to_onehot(indices)
 
             return onehot_vec, indices
         return grids
     
+    def number_to_indices(self, number):
+        """
+        Convert a number to the indices of the grid.
+        Parameters:
+        ----------
+        number (int): The number to convert to the indices of the grid.
+        """
+        # need to do first index outside the loop
+        indices = [number % self.grid_sizes[0]]
+        for j in range(1, self.n):
+            prod = self.grid_sizes[:j].prod().item()
+            indices.append(number // prod)
+        return indices
+        
     def indices_to_onehot(self, indices):
         """
         Convert the indices of the grid to a one-hot vector.
         Parameters:
         ----------
-        indices (tensor): The indices of the grid.
+        indices : The indices of the grid.
         """
-        onehot_vec = torch.zeros(self.dim)
-        onehot_vec[indices] = 1
+        if isinstance(indices, list):
+            indices = torch.tensor(indices)
+        onehot_vec = [torch.functional.F.one_hot(j, num_classes = k) for j, k in zip(indices, self.grid_sizes)]
+        onehot_vec = torch.cat(onehot_vec).to(torch.float32)
         return onehot_vec
     
 
@@ -141,9 +157,8 @@ class VectorHaSH(torch.nn.Module):
             grid_prod = S.shape[1]
         H = []
         for i in tqdm(range(grid_prod)):
-            indices = [(i // self.grid.grid_sizes[:j].prod().item()) % self.grid.sizes[j] for j in range(self.grid.n)]
-            g_vec = [torch.functional.F.one_hot(j, num_classes = k) for j, k in zip(indices, self.grid.grid_sizes)]
-            g_vec = torch.cat(g_vec).to(torch.float32)
+            indices = self.grid.number_to_indices(i)
+            g_vec = self.grid.indices_to_onehot(indices)
             h_vec = torch.nn.functional.relu(self.W_hg @ g_vec - self.theta)
             W_gh += g_vec[:, None] @ h_vec[None, :] / self.h_dim
 
@@ -155,6 +170,7 @@ class VectorHaSH(torch.nn.Module):
         if S is not None:
             H = torch.stack(H).T
 
+            # computing pseudoinverse this way
             S_inv = torch.linalg.lstsq(S, torch.eye(S.shape[0])).solution
             H_inv = torch.linalg.lstsq(H, torch.eye(H.shape[0])).solution
 
@@ -204,7 +220,7 @@ def location_recall_test(n_test, S, vhash, s_dim, n_pats):
     for i in range(n_test):
         rand_idx = np.random.randint(0, n_pats)
         pattern = S[:, rand_idx]
-        rand_idx_grid = [(rand_idx // vhash.grid.grid_sizes[:j].prod().item()) % vhash.grid.sizes[j] for j in range(vhash.grid.n)]
+        rand_idx_grid = vhash.grid.number_to_indices(rand_idx)
 
         onehot, idx = vhash(pattern)
 
@@ -219,7 +235,7 @@ def location_recall_test(n_test, S, vhash, s_dim, n_pats):
     print(f"Done! Final success rate: {success / n_test:.2f}")
     print(f"Expected success rate: {min(1, s_dim / n_pats):.2f}")
 
-def pattern_recall_test(n_test, S, vhash, n_pats,
+def pattern_recall_test(model, n_test, S, vhash, n_pats,
                         out_im_height = 5,
                         imshape = (28, 28)):
     import matplotlib.pyplot as plt
@@ -229,13 +245,13 @@ def pattern_recall_test(n_test, S, vhash, n_pats,
     dists = []
     pbar = tqdm(range(n_test))
 
-    exemplar = torch.randn(vhash.s_dim)
+    exemplar = S[:, np.random.randint(0, n_pats)]
 
     im_pairs = []
     for i in range(n_test):
         rand_idx = np.random.randint(0, n_pats)
         pattern = S[:, rand_idx]
-        rand_idx_grid = [(rand_idx // vhash.grid.grid_sizes[:j].prod().item()) % vhash.grid.sizes[j] for j in range(vhash.grid.n)]
+        rand_idx_grid = vhash.grid.number_to_indices(rand_idx)
 
         s_hat = vhash.recall_sense(rand_idx_grid)
 
@@ -247,8 +263,11 @@ def pattern_recall_test(n_test, S, vhash, n_pats,
         pbar.set_description(f"Avg Dist: {np.mean(dists):.2f} (Exemplar Dist : {exemplar_dist:.2f})")
         pbar.update(1)
 
-        im_pair = torch.concat([pattern.view(*imshape),
-                                s_hat.view(*imshape)],
+        im_orig = model.decode(pattern)
+        im_recons = model.decode(s_hat)
+
+        im_pair = torch.concat([im_orig.view(*imshape),
+                                im_recons.view(*imshape)],
                                 dim = 0)
 
         im_pairs.append(im_pair)
@@ -268,23 +287,27 @@ if __name__ == "__main__":
     sizes = [3, 5]
     n_pats = np.prod(sizes)**2
     n_test = 100
-    s_dim = 784
-    h_dim = 32
+    s_dim = 128
+    h_dim = 256
 
-    transform = transforms.Compose([transforms.ToTensor(),
-                                transforms.Lambda(lambda x: x.view(-1))])
+    transform = transforms.Compose([transforms.ToTensor()])
 
     mnist = datasets.MNIST("data/", train=True,
                            download=True, transform = transform)
-
+    
+    sensor = MNISTAutoEncoder(latent_dim = s_dim)
+    sensor, z_hat = mnist_sae_train(mnist, sensor)
+    sensor.to("cpu")
 
     dl = iter(torch.utils.data.DataLoader(mnist, batch_size = int(n_pats)))
-    S =  next(dl)[0].T
+    sample =  next(dl)[0]
+
+    sense = sensor.encode(sample).T
 
     with torch.no_grad():
-        vhash = VectorHaSH(s_dim, h_dim, sizes = sizes, S = S)
+        vhash = VectorHaSH(s_dim, h_dim, sizes = sizes, S = sense)
 
-        location_recall_test(n_test, S, vhash, s_dim, n_pats)
-        pattern_recall_test(n_test, S, vhash, n_pats)
+        location_recall_test(n_test, sense, vhash, s_dim, n_pats)
+        pattern_recall_test(sensor, n_test, sense, vhash, n_pats)
 
 
